@@ -47,6 +47,7 @@ fn generate_entity_module(entity: &AnalyzedEntity, schema: &AnalyzedSchema) -> T
     let model_fields = generate_model_fields(entity, schema);
     let relation_variants = generate_relation_variants(entity, schema);
     let related_impls = generate_related_impls(entity, schema);
+    let linked_impls = generate_linked_impls(entity, schema);
 
     // Generate timestamp fields based on entity attrs
     let created_at_field = if entity.attrs.has_created_at {
@@ -112,6 +113,7 @@ fn generate_entity_module(entity: &AnalyzedEntity, schema: &AnalyzedSchema) -> T
             }
 
             #related_impls
+            #linked_impls
 
             impl ActiveModelBehavior for ActiveModel {}
         }
@@ -329,6 +331,13 @@ fn generate_related_impls(entity: &AnalyzedEntity, _schema: &AnalyzedSchema) -> 
 }
 
 fn generate_related_impl(field: &AnalyzedField) -> Option<TokenStream> {
+    // Two fields referencing the same target can't each get a `Related` impl —
+    // Rust forbids two impls of one trait for the same type (E0119). The
+    // analyze stage nominates one; the rest get a `Linked` instead.
+    if !field.implements_related {
+        return None;
+    }
+
     let variant_name = to_pascal_case(&field.name.to_string());
     let variant_ident = format_ident!("{}", variant_name);
 
@@ -346,6 +355,58 @@ fn generate_related_impl(field: &AnalyzedField) -> Option<TokenStream> {
         }
         FieldType::Scalar { .. } => None,
     }
+}
+
+fn generate_linked_impls(entity: &AnalyzedEntity, _schema: &AnalyzedSchema) -> TokenStream {
+    let impls: Vec<TokenStream> = entity
+        .fields
+        .iter()
+        .filter_map(generate_linked_impl)
+        .collect();
+
+    quote! {
+        #(#impls)*
+    }
+}
+
+/// Generate a `Linked` for each relationship field that lost the `Related`
+/// nomination, so it stays navigable via `find_linked` rather than requiring a
+/// hand-written join.
+///
+/// Mutually exclusive with `generate_related_impl`: a field gets exactly one of
+/// the two. A field that already has `Related` reaches its target through
+/// `find_related`/`find_also_related`/`find_with_related`, so a `Linked` on top
+/// would add generated surface without adding reachability.
+fn generate_linked_impl(field: &AnalyzedField) -> Option<TokenStream> {
+    if field.implements_related {
+        return None;
+    }
+
+    // `Relation::#variant.def()` is correct for both relationship kinds. For a
+    // has_many that lost, the variant already resolves to the winning
+    // belongs_to reversed, which is the join this field wanted.
+    let target = match &field.ty {
+        FieldType::HasMany { target } | FieldType::BelongsTo { target, .. } => target,
+        FieldType::Scalar { .. } => return None,
+    };
+
+    let variant_name = to_pascal_case(&field.name.to_string());
+    let variant_ident = format_ident!("{}", variant_name);
+    let target_mod = format_ident!("{}", target.to_string().to_snake_case());
+    let link_ident = format_ident!("{}Link", variant_name);
+
+    Some(quote! {
+        pub struct #link_ident;
+
+        impl Linked for #link_ident {
+            type FromEntity = Entity;
+            type ToEntity = super::#target_mod::Entity;
+
+            fn link(&self) -> Vec<RelationDef> {
+                vec![Relation::#variant_ident.def()]
+            }
+        }
+    })
 }
 
 /// Convert snake_case or camelCase to PascalCase.
@@ -848,5 +909,96 @@ mod tests {
         assert!(output.contains("pub org_id : rapina :: uuid :: Uuid"));
         // Task.project_id should be Uuid (resolved from Project's PK)
         assert!(output.contains("pub project_id : rapina :: uuid :: Uuid"));
+    }
+
+    // ---- issue #678: one Related per target, Linked for the rest ----
+
+    fn generate_output(input: proc_macro2::TokenStream) -> String {
+        let parsed = parse_schema(input).unwrap();
+        let analyzed = analyze_schema(parsed).unwrap();
+        generate_schema(analyzed).to_string()
+    }
+
+    #[test]
+    fn test_ambiguous_target_gets_one_related_and_one_linked() {
+        let output = generate_output(quote! {
+            Account { name: String, }
+            Tx {
+                amount: i64,
+                #[related]
+                from: Option<Account>,
+                to: Option<Account>,
+            }
+        });
+
+        // Exactly one Related impl, pointing at the marked field.
+        assert_eq!(
+            output
+                .matches("impl Related < super :: account :: Entity > for Entity")
+                .count(),
+            1
+        );
+        assert!(output.contains("Relation :: From . def ()"));
+
+        // The other field is reachable through a generated Linked.
+        assert!(output.contains("pub struct ToLink"));
+        assert!(output.contains("impl Linked for ToLink"));
+        assert!(!output.contains("pub struct FromLink"));
+    }
+
+    #[test]
+    fn test_unambiguous_relation_gets_no_linked() {
+        let output = generate_output(quote! {
+            User { email: String, }
+            Post { title: String, author: User, }
+        });
+
+        assert!(output.contains("impl Related < super :: user :: Entity > for Entity"));
+        assert!(!output.contains("impl Linked for"));
+    }
+
+    #[test]
+    fn test_ambiguous_target_still_generates_all_columns_and_variants() {
+        // Losing the Related nomination must not affect the FK column or the
+        // Relation variant, so an explicit join stays available for every field.
+        let output = generate_output(quote! {
+            Account { name: String, }
+            Tx {
+                amount: i64,
+                #[related]
+                from: Option<Account>,
+                to: Option<Account>,
+            }
+        });
+
+        assert!(output.contains("pub from_id : Option < i32 >"));
+        assert!(output.contains("pub to_id : Option < i32 >"));
+        assert_eq!(
+            output
+                .matches("belongs_to = \"super::account::Entity\"")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_mixed_group_links_the_has_many_side() {
+        let output = generate_output(quote! {
+            Category {
+                name: String,
+                parent: Option<Category>,
+                children: Vec<Category>,
+            }
+        });
+
+        // parent wins without any annotation; children gets the Linked.
+        assert_eq!(
+            output
+                .matches("impl Related < super :: category :: Entity > for Entity")
+                .count(),
+            1
+        );
+        assert!(output.contains("Relation :: Parent . def ()"));
+        assert!(output.contains("pub struct ChildrenLink"));
     }
 }

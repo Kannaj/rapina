@@ -184,6 +184,66 @@ Relationships are inferred from types:
 | `author: User` | belongs_to | `author_id: i32` column |
 | `author: Option<User>` | optional belongs_to | `author_id: Option<i32>` |
 
+#### Multiple relationships to the same entity
+
+When two or more fields reference the same entity, mark one with `#[related]`:
+
+```rust
+Account {
+    name: String,
+}
+
+Transfer {
+    amount: i64,
+    #[related]
+    from: Option<Account>,
+    to: Option<Account>,
+}
+```
+
+SeaORM's `Related<Account>` answers "what is *the* join between `Transfer` and
+`Account`", and it can only be implemented once per target. `#[related]` says
+which field that is. Omitting it — or putting it on more than one field — is a
+compile error naming the fields involved.
+
+The marked field is reached the usual way, and the others through a generated
+`{Field}Link`:
+
+```rust
+// from — the marked field
+transfer.find_related(account::Entity)
+Transfer::find().find_also_related(account::Entity)
+
+// to — every other field in the group
+transfer.find_linked(transfer::ToLink)
+```
+
+Every field also keeps its `Relation` variant and foreign key column, so an
+explicit join always works regardless of which field was marked:
+
+```rust
+Transfer::find().join(JoinType::InnerJoin, transfer::Relation::To.def())
+```
+
+A group with only one `belongs_to` field needs no annotation, because there is
+nothing to choose between. This is the common parent/children shape:
+
+```rust
+Category {
+    name: String,
+    parent: Option<Category>,    // wins automatically
+    children: Vec<Category>,     // reachable via CategoryChildrenLink
+}
+```
+
+`#[related]` is only valid on `belongs_to` fields. A `Vec<T>` field carries no
+foreign key of its own — SeaORM derives its join by reversing the target's
+`Related` implementation — so it cannot be nominated. Two `Vec<T>` fields
+referencing the same entity currently cannot be expressed and produce a compile
+error.
+
+> **Important:** Moving `#[related]` from one field to another changes which join `find_related` performs. Both versions compile, so treat relocating the attribute as a behavior change in review. The choice is also per-entity: if `Transfer` marks `from`, that does not constrain what `Account` marks on any field pointing back at `Transfer`.
+
 ### Attributes
 
 #### Entity Attributes
@@ -233,6 +293,7 @@ UserRole {
 |-----------|-------------|
 | `#[unique]` | Mark field as unique |
 | `#[index]` | Create an index on this column |
+| `#[related]` | Choose which `belongs_to` field owns `find_related` when several reference the same entity ([details](#multiple-relationships-to-the-same-entity)) |
 | `#[column = "name"]` | Custom column name in database |
 
 ```rust

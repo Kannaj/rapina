@@ -49,6 +49,12 @@ pub struct FieldAttrs {
     pub column_name: Option<String>,
     /// Mark field as indexed, e.g., #[index]
     pub indexed: bool,
+    /// Mark field as the canonical `Related` target, e.g., #[related]
+    ///
+    /// Required when two or more `belongs_to` fields on the same entity
+    /// reference the same target entity: SeaORM's `Related<T>` can only be
+    /// implemented once per target, so exactly one field must claim it.
+    pub related: bool,
 }
 
 /// A single entity definition.
@@ -269,6 +275,9 @@ fn parse_field_attrs(input: ParseStream) -> Result<FieldAttrs> {
             "index" => {
                 attrs.indexed = true;
             }
+            "related" => {
+                attrs.related = true;
+            }
             "column" => {
                 content.parse::<Token![=]>()?;
                 let value: syn::LitStr = content.parse()?;
@@ -278,7 +287,7 @@ fn parse_field_attrs(input: ParseStream) -> Result<FieldAttrs> {
                 return Err(syn::Error::new(
                     attr_name.span(),
                     format!(
-                        "unknown field attribute '{}'. Supported: unique, index, column",
+                        "unknown field attribute '{}'. Supported: unique, index, related, column",
                         attr_name_str
                     ),
                 ));
@@ -695,6 +704,39 @@ mod tests {
 
         let schema = parse_schema(input).unwrap();
         assert!(schema.entities[0].fields[0].attrs.indexed);
+    }
+
+    #[test]
+    fn test_parse_related_attr() {
+        let input = quote! {
+            Account {
+                name: String,
+            }
+
+            Tx {
+                from: Option<Account>,
+                #[related]
+                to: Option<Account>,
+            }
+        };
+
+        let schema = parse_schema(input).unwrap();
+        let fields = &schema.entities[1].fields;
+        assert!(!fields[0].attrs.related);
+        assert!(fields[1].attrs.related);
+    }
+
+    #[test]
+    fn test_unknown_field_attr_lists_related() {
+        let input = quote! {
+            User {
+                #[bogus]
+                email: String,
+            }
+        };
+
+        let err = parse_schema(input).unwrap_err().to_string();
+        assert!(err.contains("unique, index, related, column"), "{err}");
     }
 
     #[test]
