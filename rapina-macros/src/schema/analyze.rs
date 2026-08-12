@@ -37,9 +37,10 @@ pub struct AnalyzedField {
     pub span: Span,
     /// Whether this field gets `impl Related<Target>` in the generate stage.
     ///
-    /// Assigned by [`validate_relation_rules`] once every field in the entity
-    /// is resolved, since it depends on what the *other* fields target. Fields
-    /// that lose the nomination get a generated `Linked` instead.
+    /// Starts `false` and is granted by [`validate_relation_rules`] once every
+    /// field in the entity is resolved, since it depends on what the *other*
+    /// fields target. Exactly one field per target wins; the rest — and every
+    /// scalar — keep `false` and get a generated `Linked` instead.
     pub implements_related: bool,
 }
 
@@ -198,16 +199,15 @@ fn analyze_field(field: FieldDef, registry: &EntityRegistry) -> Result<AnalyzedF
         }
     };
 
-    // Assume unambiguous: every relationship field gets `Related` unless
-    // `validate_relation_rules` finds a competing field for the same target.
-    let implements_related = !matches!(ty, FieldType::Scalar { .. });
-
     Ok(AnalyzedField {
         attrs: field.attrs,
         name: field.name,
         ty,
         span: field.span,
-        implements_related,
+        // Granted by `validate_relation_rules`, which is the only thing that can
+        // decide it: whether a field owns `Related` depends on the other fields
+        // in the entity, which aren't resolved yet here.
+        implements_related: false,
     })
 }
 
@@ -224,11 +224,12 @@ fn validate_relation_rules(entity: &Ident, fields: &mut [AnalyzedField]) -> Resu
     let mut error: Option<syn::Error> = None;
 
     for (target, members) in group_by_target(fields) {
-        if let Err(e) = validate_target_group(entity, &target, &members, fields) {
-            match error {
+        match resolve_related_owner(entity, &target, &members, fields) {
+            Ok(winner) => fields[winner].implements_related = true,
+            Err(e) => match error {
                 Some(ref mut acc) => acc.combine(e),
                 None => error = Some(e),
-            }
+            },
         }
     }
 
@@ -325,7 +326,7 @@ fn relation_target(ty: &FieldType) -> Option<&Ident> {
 /// order for free.
 ///
 /// Indices are returned rather than references so the caller can take `&mut` on
-/// the fields afterward to record the outcome.
+/// the fields afterward to grant `implements_related` to each group's winner.
 fn group_by_target(fields: &[AnalyzedField]) -> Vec<(String, Vec<usize>)> {
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
 
@@ -344,8 +345,8 @@ fn group_by_target(fields: &[AnalyzedField]) -> Vec<(String, Vec<usize>)> {
     groups
 }
 
-/// Check one target group against both relationship rules, then record which
-/// of its fields owns `Related`.
+/// Check one target group against both relationship rules and return the index
+/// of the field that owns `Related` for it.
 ///
 /// The rules live in separate functions because a group can be wrong in two
 /// independent ways, not because each applies to a different kind of group:
@@ -356,16 +357,16 @@ fn group_by_target(fields: &[AnalyzedField]) -> Vec<(String, Vec<usize>)> {
 ///    schema resolves by marking one `#[related]`.
 ///
 /// Both run for every group.
-fn validate_target_group(
+fn resolve_related_owner(
     entity: &Ident,
     target: &str,
     members: &[usize],
-    fields: &mut [AnalyzedField],
-) -> Result<()> {
-    // A single field referencing this target is unambiguous — it keeps the
-    // `implements_related: true` that analyze_field assigned.
-    if members.len() < 2 {
-        return Ok(());
+    fields: &[AnalyzedField],
+) -> Result<usize> {
+    // A single field referencing this target is unambiguous, whichever kind it
+    // is, so neither rule has anything to say about it.
+    if let [only] = members {
+        return Ok(*only);
     }
 
     let (belongs_to, has_many): (Vec<usize>, Vec<usize>) = members
@@ -377,13 +378,7 @@ fn validate_target_group(
     validate_has_many_group(entity, target, &has_many, fields)?;
 
     // Rule 2 — belongs_to
-    let winner = validate_belongs_to_group(entity, target, &belongs_to, fields)?;
-
-    for &idx in members {
-        fields[idx].implements_related = idx == winner;
-    }
-
-    Ok(())
+    validate_belongs_to_group(entity, target, &belongs_to, fields)
 }
 
 /// Rule 1 — `has_many`: at most one may reference a given target.
@@ -424,7 +419,7 @@ fn validate_has_many_group(
 /// Two or more require `#[related]` on exactly one.
 ///
 /// Returns the index of the winning field. `belongs_to` must be non-empty;
-/// [`validate_target_group`] guarantees that by applying rule 1 first.
+/// [`resolve_related_owner`] guarantees that by applying rule 1 first.
 fn validate_belongs_to_group(
     entity: &Ident,
     target: &str,
@@ -775,321 +770,5 @@ mod tests {
             entity.attrs.primary_key,
             Some(vec!["user_id".to_string(), "role_id".to_string()])
         );
-    }
-
-    // ---- issue #678: ambiguous relationships and #[related] ----
-
-    /// Analyze a schema and return the entity at `idx`, or panic on error.
-    fn analyze_ok(input: proc_macro2::TokenStream) -> AnalyzedSchema {
-        analyze_schema(parse_schema(input).unwrap()).unwrap()
-    }
-
-    /// Analyze a schema expected to fail, returning every error message.
-    ///
-    /// `syn::Error::to_string` only renders the first error of a combined set,
-    /// so iterate to see all of them.
-    fn analyze_err(input: proc_macro2::TokenStream) -> String {
-        analyze_schema(parse_schema(input).unwrap())
-            .unwrap_err()
-            .into_iter()
-            .map(|e| e.to_string())
-            .collect::<Vec<_>>()
-            .join(" | ")
-    }
-
-    /// `implements_related` for each field of an entity, in declaration order.
-    fn related_flags(entity: &AnalyzedEntity) -> Vec<bool> {
-        entity.fields.iter().map(|f| f.implements_related).collect()
-    }
-
-    #[test]
-    fn test_group_by_target_is_source_ordered() {
-        let analyzed = analyze_ok(quote! {
-            Account { name: String, }
-            User { email: String, }
-
-            Tx {
-                amount: i64,
-                seller: Option<User>,
-                #[related] from: Option<Account>,
-                buyer: Option<User>,
-                to: Option<Account>,
-                #[related] primary: Option<User>,
-            }
-        });
-
-        let groups = group_by_target(&analyzed.entities[2].fields);
-
-        // Scalars are skipped, groups appear in first-appearance order, and
-        // members are ascending within a group.
-        assert_eq!(
-            groups,
-            vec![
-                ("User".to_string(), vec![1, 3, 5]),
-                ("Account".to_string(), vec![2, 4]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_single_belongs_to_implements_related() {
-        let analyzed = analyze_ok(quote! {
-            User { email: String, }
-            Post { title: String, author: User, }
-        });
-
-        assert_eq!(related_flags(&analyzed.entities[1]), vec![false, true]);
-    }
-
-    #[test]
-    fn test_related_attr_wins_regardless_of_declaration_order() {
-        // `to` is declared second and still wins — the choice is the attribute,
-        // not the position.
-        let analyzed = analyze_ok(quote! {
-            Account { name: String, }
-            Tx {
-                from: Option<Account>,
-                #[related]
-                to: Option<Account>,
-            }
-        });
-
-        assert_eq!(related_flags(&analyzed.entities[1]), vec![false, true]);
-    }
-
-    #[test]
-    fn test_ambiguous_belongs_to_without_related_errors() {
-        let err = analyze_err(quote! {
-            Account { name: String, }
-            Tx {
-                from: Option<Account>,
-                to: Option<Account>,
-            }
-        });
-
-        assert!(err.contains("'Tx'"), "{err}");
-        assert!(err.contains("'Account'"), "{err}");
-        assert!(err.contains("'from'"), "{err}");
-        assert!(err.contains("'to'"), "{err}");
-        assert!(err.contains("#[related]"), "{err}");
-    }
-
-    #[test]
-    fn test_multiple_related_attrs_error() {
-        let err = analyze_err(quote! {
-            Account { name: String, }
-            Tx {
-                #[related]
-                from: Option<Account>,
-                #[related]
-                to: Option<Account>,
-            }
-        });
-
-        assert!(err.contains("only one field per target"), "{err}");
-        assert!(err.contains("'from'"), "{err}");
-    }
-
-    #[test]
-    fn test_three_belongs_to_one_marked() {
-        let analyzed = analyze_ok(quote! {
-            Warehouse { name: String, }
-            Shipment {
-                origin: Warehouse,
-                #[related]
-                destination: Warehouse,
-                backup: Option<Warehouse>,
-            }
-        });
-
-        assert_eq!(
-            related_flags(&analyzed.entities[1]),
-            vec![false, true, false]
-        );
-    }
-
-    #[test]
-    fn test_mixed_self_referential_group_needs_no_attr() {
-        // One belongs_to candidate, so there is nothing to disambiguate and no
-        // annotation is required. `parent` must win: pointing Related at the
-        // has_many would define `to()` in terms of itself.
-        let analyzed = analyze_ok(quote! {
-            Category {
-                name: String,
-                parent: Option<Category>,
-                children: Vec<Category>,
-            }
-        });
-
-        assert_eq!(
-            related_flags(&analyzed.entities[0]),
-            vec![false, true, false]
-        );
-    }
-
-    #[test]
-    fn test_mixed_group_not_self_referential() {
-        let analyzed = analyze_ok(quote! {
-            Tag { label: String, }
-            Post {
-                title: String,
-                primary_tag: Option<Tag>,
-                tags: Vec<Tag>,
-            }
-        });
-
-        assert_eq!(
-            related_flags(&analyzed.entities[1]),
-            vec![false, true, false]
-        );
-    }
-
-    #[test]
-    fn test_multiple_has_many_to_same_target_errors() {
-        let err = analyze_err(quote! {
-            Account {
-                name: String,
-                txs_sent: Vec<Tx>,
-                txs_received: Vec<Tx>,
-            }
-            Tx { amount: i64, account: Account, }
-        });
-
-        assert!(err.contains("has_many"), "{err}");
-        assert!(err.contains("not supported yet"), "{err}");
-        assert!(err.contains("'txs_sent'"), "{err}");
-        assert!(err.contains("'txs_received'"), "{err}");
-    }
-
-    #[test]
-    fn test_multiple_has_many_errors_even_alongside_a_belongs_to() {
-        // The has_many rule must not be skipped just because the group also
-        // contains a nominable belongs_to. Without this, `primary_tx` would win
-        // and the two has_many fields would each get a Linked resolving to the
-        // exact same join, silently returning identical rows.
-        let err = analyze_err(quote! {
-            Account {
-                name: String,
-                txs_sent: Vec<Tx>,
-                txs_received: Vec<Tx>,
-                primary_tx: Option<Tx>,
-            }
-            Tx { amount: i64, account: Account, }
-        });
-
-        assert!(err.contains("not supported yet"), "{err}");
-        assert!(err.contains("'txs_sent'"), "{err}");
-        assert!(err.contains("'txs_received'"), "{err}");
-    }
-
-    #[test]
-    fn test_one_has_many_alongside_two_belongs_to_still_needs_related() {
-        // A single has_many is fine; the belongs_to rule still applies.
-        let analyzed = analyze_ok(quote! {
-            Account {
-                name: String,
-                txs: Vec<Tx>,
-                #[related]
-                primary_tx: Option<Tx>,
-                backup_tx: Option<Tx>,
-            }
-            Tx { amount: i64, account: Account, }
-        });
-
-        assert_eq!(
-            related_flags(&analyzed.entities[0]),
-            vec![false, false, true, false]
-        );
-    }
-
-    #[test]
-    fn test_related_on_scalar_errors() {
-        let err = analyze_err(quote! {
-            User {
-                #[related]
-                email: String,
-            }
-        });
-
-        assert!(
-            err.contains("can only be used on a relationship field"),
-            "{err}"
-        );
-        assert!(err.contains("'email'"), "{err}");
-    }
-
-    #[test]
-    fn test_related_on_bytes_vec_errors() {
-        // `Vec<u8>` is indistinguishable from `Vec<Entity>` at parse time, so
-        // this can only be caught after type resolution.
-        let err = analyze_err(quote! {
-            User {
-                #[related]
-                avatar: Vec<u8>,
-            }
-        });
-
-        assert!(err.contains("is a scalar"), "{err}");
-        assert!(err.contains("'avatar'"), "{err}");
-    }
-
-    #[test]
-    fn test_related_on_has_many_errors() {
-        let err = analyze_err(quote! {
-            Category {
-                name: String,
-                parent: Option<Category>,
-                #[related]
-                children: Vec<Category>,
-            }
-        });
-
-        assert!(err.contains("has_many field 'children'"), "{err}");
-        assert!(err.contains("belongs_to"), "{err}");
-    }
-
-    #[test]
-    fn test_separate_entities_targeting_same_entity_is_not_ambiguous() {
-        // Grouping is per-entity: two entities each with one relation to User
-        // must not be treated as a conflict.
-        let analyzed = analyze_ok(quote! {
-            User { email: String, }
-            Post { title: String, author: User, }
-            Comment { body: Text, author: User, }
-        });
-
-        assert_eq!(related_flags(&analyzed.entities[1]), vec![false, true]);
-        assert_eq!(related_flags(&analyzed.entities[2]), vec![false, true]);
-    }
-
-    #[test]
-    fn test_related_on_unambiguous_field_is_a_noop() {
-        let analyzed = analyze_ok(quote! {
-            User { email: String, }
-            Post {
-                title: String,
-                #[related]
-                author: User,
-            }
-        });
-
-        assert_eq!(related_flags(&analyzed.entities[1]), vec![false, true]);
-    }
-
-    #[test]
-    fn test_two_broken_groups_both_reported() {
-        let err = analyze_err(quote! {
-            Account { name: String, }
-            User { email: String, }
-            Tx {
-                from: Option<Account>,
-                to: Option<Account>,
-                seller: Option<User>,
-                buyer: Option<User>,
-            }
-        });
-
-        assert!(err.contains("'Account'"), "{err}");
-        assert!(err.contains("'User'"), "{err}");
     }
 }

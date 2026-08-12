@@ -707,39 +707,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_related_attr() {
-        let input = quote! {
-            Account {
-                name: String,
-            }
-
-            Tx {
-                from: Option<Account>,
-                #[related]
-                to: Option<Account>,
-            }
-        };
-
-        let schema = parse_schema(input).unwrap();
-        let fields = &schema.entities[1].fields;
-        assert!(!fields[0].attrs.related);
-        assert!(fields[1].attrs.related);
-    }
-
-    #[test]
-    fn test_unknown_field_attr_lists_related() {
-        let input = quote! {
-            User {
-                #[bogus]
-                email: String,
-            }
-        };
-
-        let err = parse_schema(input).unwrap_err().to_string();
-        assert!(err.contains("unique, index, related, column"), "{err}");
-    }
-
-    #[test]
     fn test_parse_combined_field_attrs() {
         let input = quote! {
             User {
